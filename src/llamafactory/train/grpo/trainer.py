@@ -1,4 +1,127 @@
+# trainer.py
 import warnings
+from collections import defaultdict
+from contextlib import nullcontext
+from types import MethodType
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union, List
+import re
+
+import torch
+import torch.nn.functional as F
+from transformers import Trainer, PreTrainedModel, logging
+from trl import GRPOTrainer  # GRPO trainer from TRL
+from trl.trainer import disable_dropout_in_model
+from typing_extensions import override
+
+from ...extras.constants import IGNORE_INDEX
+from ...extras.packages import is_transformers_version_greater_than
+from ..callbacks import SaveProcessorCallback
+from ..trainer_utils import create_custom_optimizer, create_custom_scheduler, get_batch_logps, nested_detach
+
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel, ProcessorMixin, TrainingArguments
+    from ...hparams import FinetuningArguments
+    from datasets import Dataset
+
+logger = logging.get_logger(__name__)
+
+class CustomGRPOTrainer(GRPOTrainer):
+
+    def __init__(
+        self,
+        model: Union["PreTrainedModel", torch.nn.Module] = None,
+        ref_model: Optional[Union["PreTrainedModel", torch.nn.Module]] = None,
+        args: Optional["TrainingArguments"] = None,
+        finetuning_args: Optional["FinetuningArguments"] = None,
+        train_dataset: Optional["Dataset"] = None,
+        eval_dataset: Optional[Union["Dataset", Dict[str, "Dataset"]]] = None,
+        tokenizer: Optional["ProcessorMixin"] = None,
+        reward_funcs:Optional[List]=None,
+        **kwargs, #All other arguments to the GRPOTrainer
+    ):
+        if is_transformers_version_greater_than("4.46"):
+            if tokenizer:
+                kwargs["processing_class"] = tokenizer
+
+        if args.disable_dropout: # if not given set to be true by default.
+            disable_dropout_in_model(model)
+            if ref_model is not None:
+                disable_dropout_in_model(ref_model)
+
+        self.finetuning_args = finetuning_args
+        self.ref_model = ref_model
+        self.reward_funcs = reward_funcs
+
+        # Initialize the base Trainer via GRPOTrainer.__init__
+        super().__init__(model=model,
+            ref_model=ref_model,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            reward_funcs = reward_funcs,
+            **kwargs)
+
+        warnings.simplefilter("ignore")  # suppress warnings on ref_model
+        if ref_model:
+             if self.is_deepspeed_enabled:
+                 if not (getattr(ref_model, "is_loaded_in_8bit", False) or getattr(ref_model, "is_loaded_in_4bit", False)):
+                     self.ref_model = self._prepare_deepspeed(self.ref_model)
+             else:
+                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+                 self.ref_model.eval()
+
+    def compute_loss(
+        self,
+        model: "PreTrainedModel",
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        return_outputs: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+        Subclass and override for custom behavior.
+        """
+        kwargs = {}
+        if self.args.use_reward_model:
+            with torch.no_grad():
+                if self.ref_model is None:
+                    self.ref_model = model
+
+                if "labels" in inputs:
+                    kwargs.update({"labels": inputs.pop("labels")})
+
+                ref_model_outputs = self.ref_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    **kwargs,
+                )
+                rewards = ref_model_outputs.rewards.to(self.args.device)
+        else:
+            rewards = None
+            # print("inputs", inputs)
+            if self.reward_funcs is not None:
+                rewards = torch.tensor(
+                    [
+                        sum([func(inputs["prompt"], inputs["completion"], inputs['answer'], **kwargs) for func in self.reward_funcs])
+                    ]
+                ).to(self.args.device)
+        if "labels" in inputs:
+            kwargs.update({"labels": inputs.pop("labels")})
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            **kwargs,
+        )
+
+        loss = outputs.loss
+        # Calculate reward mean and add to outputs
+        # This part is important, as TRL uses these metrics internally.
+        if rewards is not None:
+            reward_mean = torch.mean(rewards)
+            outputs.metrics = {"reward": reward_mean}
+
+        return (loss, outputs) if return_outputs else lossimport warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from types import MethodType
